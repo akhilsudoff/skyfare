@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SkyFare</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h1 { margin-bottom: 0; }
+  h3 { font-size: 0.95rem; margin: 14px 0 6px; }
+  .sub { color: #666; margin-top: 4px; }
+  .hint { color: #666; font-size: 0.85rem; margin: 0 0 8px; }
+  section { border: 1px solid #ddd; border-radius: 8px; padding: 14px 16px; margin: 16px 0; }
+  h2 { margin: 0 0 10px; font-size: 1.1rem; }
+  label { display: inline-block; margin: 4px 10px 4px 0; font-size: 0.85rem; color: #444; }
+  input, select { padding: 6px; border: 1px solid #bbb; border-radius: 4px; }
+  button { padding: 6px 12px; border: 0; border-radius: 4px; background: #1f4e79; color: #fff; cursor: pointer; }
+  button.secondary { background: #777; }
+  button.small { padding: 3px 8px; font-size: 0.8rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 0.9rem; }
+  .msg { margin-top: 8px; font-size: 0.85rem; color: #a00; min-height: 1em; }
+  .msg.ok { color: #070; }
+  .hidden { display: none; }
+  ul { padding-left: 18px; margin: 6px 0; }
+  li { margin: 3px 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>SkyFare</h1>
+<p class="sub">Flight fare search and price alerts. Demo UI. Fares are simulated.</p>
+
+<section>
+  <h2>Account</h2>
+  <div id="loggedOut">
+    <label>Email <input id="email" type="email"></label>
+    <label>Password (8+ chars) <input id="password" type="password"></label>
+    <button id="registerBtn">Register</button>
+    <button id="loginBtn" class="secondary">Log in</button>
+  </div>
+  <div id="loggedIn" class="hidden">
+    Signed in as <strong id="who"></strong>
+    <button id="logoutBtn" class="secondary small">Log out</button>
+  </div>
+  <div id="authMsg" class="msg"></div>
+</section>
+
+<section>
+  <h2>Search fares</h2>
+  <p class="hint">Prices every date in the window at the same time and shows the cheapest fare per day.</p>
+  <label>From <input id="sOrigin" value="ADL" size="4" maxlength="3"></label>
+  <label>To <input id="sDest" value="SYD" size="4" maxlength="3"></label>
+  <label>Date <input id="sDate" type="date"></label>
+  <label>Flex days
+    <select id="sFlex"><option>0</option><option>1</option><option selected>2</option><option>3</option></select>
+  </label>
+  <button id="searchBtn">Search</button>
+  <div id="searchMsg" class="msg"></div>
+  <table id="searchTable" class="hidden">
+    <thead><tr><th>Date</th><th>Carrier</th><th>Price</th><th>Stops</th></tr></thead>
+    <tbody id="searchRows"></tbody>
+  </table>
+</section>
+
+<section id="watchSection" class="hidden">
+  <h2>My watches</h2>
+  <p class="hint">The worker re-prices watched routes about once a minute, so allow up to 75 seconds. Fares range from about $120 to $720, so a target of 720 triggers an alert on the first poll.</p>
+  <label>From <input id="wOrigin" value="ADL" size="4" maxlength="3"></label>
+  <label>To <input id="wDest" value="SYD" size="4" maxlength="3"></label>
+  <label>Date <input id="wDate" type="date"></label>
+  <label>Target price <input id="wTarget" type="number" min="1" step="1" value="720" style="width:80px"></label>
+  <button id="addWatchBtn">Add watch</button>
+  <div id="watchMsg" class="msg"></div>
+  <table>
+    <thead><tr><th>Route</th><th>Date</th><th>Target</th><th>Last price</th><th></th></tr></thead>
+    <tbody id="watchRows"></tbody>
+  </table>
+  <div id="historyBox"></div>
+</section>
+
+<section id="alertSection" class="hidden">
+  <h2>Alerts</h2>
+  <button id="refreshBtn" class="secondary small">Refresh</button>
+  <ul id="alertList"></ul>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let token = localStorage.getItem('token');
+let email = localStorage.getItem('email');
+
+async function api(path, options = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  const sendToken = token && !path.startsWith('/api/auth/');
+  if (sendToken) headers['Authorization'] = 'Bearer ' + token;
+  const res = await fetch(path, { ...options, headers });
+  if (res.status === 401 && sendToken) {
+    logout();
+    throw new Error('Session expired. Please log in again.');
+  }
+  if (!res.ok) {
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* no JSON body */ }
+    const err = new Error(res.status + ' ' + ((body && body.error) || res.statusText));
+    err.status = res.status;
+    err.body = body;
+    throw err;
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+function describe(e) {
+  if (e.body && e.body.fields) {
+    return Object.entries(e.body.fields).map(([k, v]) => k + ' ' + v).join('; ');
+  }
+  if (e.status === 401) return 'Invalid email or password.';
+  if (e.status === 409) return 'That email is already registered. Try logging in.';
+  return e.message;
+}
+
+function say(el, text, ok) {
+  el.textContent = text;
+  el.className = 'msg' + (ok ? ' ok' : '');
+}
+
+function money(x) {
+  return x === null || x === undefined ? '-' : '$' + Number(x).toFixed(2);
+}
+
+function addRow(tbody, cells) {
+  const tr = document.createElement('tr');
+  cells.forEach((c) => {
+    const td = document.createElement('td');
+    if (c instanceof Node) td.appendChild(c); else td.textContent = c;
+    tr.appendChild(td);
+  });
+  tbody.appendChild(tr);
+}
+
+function render() {
+  const signedIn = !!token;
+  $('loggedOut').classList.toggle('hidden', signedIn);
+  $('loggedIn').classList.toggle('hidden', !signedIn);
+  $('watchSection').classList.toggle('hidden', !signedIn);
+  $('alertSection').classList.toggle('hidden', !signedIn);
+  $('who').textContent = email || '';
+}
+
+function logout() {
+  token = null;
+  email = null;
+  localStorage.removeItem('token');
+  localStorage.removeItem('email');
+  render();
+}
+
+async function authenticate(kind) {
+  say($('authMsg'), '');
+  try {
+    const res = await api('/api/auth/' + kind, {
+      method: 'POST',
+      body: JSON.stringify({ email: $('email').value.trim(), password: $('password').value })
+    });
+    token = res.token;
+    email = res.email;
+    localStorage.setItem('token', token);
+    localStorage.setItem('email', email);
+    $('password').value = '';
+    render();
+    refreshAll();
+  } catch (e) {
+    say($('authMsg'), describe(e));
+  }
+}
+
+async function search() {
+  const msg = $('searchMsg');
+  say(msg, '');
+  const q = new URLSearchParams({
+    origin: $('sOrigin').value.trim(),
+    destination: $('sDest').value.trim(),
+    date: $('sDate').value,
+    flexDays: $('sFlex').value
+  });
+  try {
+    const t0 = performance.now();
+    const fares = await api('/api/search?' + q);
+    const ms = Math.round(performance.now() - t0);
+    const tbody = $('searchRows');
+    tbody.textContent = '';
+    fares.forEach((f) => addRow(tbody, [f.departureDate, f.carrier, money(f.price), String(f.stops)]));
+    $('searchTable').classList.toggle('hidden', fares.length === 0);
+    say(msg, fares.length + ' dates priced in ' + ms + ' ms', true);
+  } catch (e) {
+    say(msg, describe(e));
+  }
+}
+
+async function loadWatches() {
+  const watches = await api('/api/watches');
+  const tbody = $('watchRows');
+  tbody.textContent = '';
+  watches.forEach((w) => {
+    const actions = document.createElement('span');
+    const hist = document.createElement('button');
+    hist.textContent = 'History';
+    hist.className = 'secondary small';
+    hist.onclick = () => showHistory(w);
+    const del = document.createElement('button');
+    del.textContent = 'Remove';
+    del.className = 'secondary small';
+    del.style.marginLeft = '6px';
+    del.onclick = () => removeWatch(w.id);
+    actions.append(hist, del);
+    addRow(tbody, [w.origin + ' to ' + w.destination, w.departDate, money(w.targetPrice), money(w.lastPrice), actions]);
+  });
+}
+
+async function addWatch() {
+  const msg = $('watchMsg');
+  say(msg, '');
+  try {
+    await api('/api/watches', {
+      method: 'POST',
+      body: JSON.stringify({
+        origin: $('wOrigin').value.trim(),
+        destination: $('wDest').value.trim(),
+        departDate: $('wDate').value,
+        targetPrice: Number($('wTarget').value)
+      })
+    });
+    say(msg, 'Watch added. Check back in about a minute.', true);
+    await loadWatches();
+  } catch (e) {
+    say(msg, describe(e));
+  }
+}
+
+async function removeWatch(id) {
+  try {
+    await api('/api/watches/' + id, { method: 'DELETE' });
+    $('historyBox').textContent = '';
+    await loadWatches();
+    await loadAlerts();
+  } catch (e) {
+    say($('watchMsg'), describe(e));
+  }
+}
+
+async function showHistory(w) {
+  const box = $('historyBox');
+  box.textContent = '';
+  try {
+    const points = await api('/api/watches/' + w.id + '/history?limit=20');
+    const h = document.createElement('h3');
+    h.textContent = 'Price history, ' + w.origin + ' to ' + w.destination + ' on ' + w.departDate;
+    box.appendChild(h);
+    if (points.length === 0) {
+      const p = document.createElement('p');
+      p.className = 'hint';
+      p.textContent = 'No observations yet. The worker polls about once a minute.';
+      box.appendChild(p);
+      return;
+    }
+    const ul = document.createElement('ul');
+    points.forEach((p) => {
+      const li = document.createElement('li');
+      li.textContent = new Date(p.observedAt).toLocaleTimeString() + ': ' + money(p.price) + ' (' + p.carrier + ')';
+      ul.appendChild(li);
+    });
+    box.appendChild(ul);
+  } catch (e) {
+    say($('watchMsg'), describe(e));
+  }
+}
+
+async function loadAlerts() {
+  const alerts = await api('/api/notifications');
+  const ul = $('alertList');
+  ul.textContent = '';
+  if (alerts.length === 0) {
+    const li = document.createElement('li');
+    li.textContent = 'No alerts yet.';
+    ul.appendChild(li);
+    return;
+  }
+  alerts.forEach((n) => {
+    const li = document.createElement('li');
+    li.textContent = n.message + ' (' + new Date(n.createdAt).toLocaleString() + ')';
+    ul.appendChild(li);
+  });
+}
+
+async function refreshAll() {
+  if (!token) return;
+  try {
+    await loadWatches();
+    await loadAlerts();
+  } catch (e) {
+    say($('watchMsg'), describe(e));
+  }
+}
+
+function isoDate(daysAhead) {
+  const d = new Date();
+  d.setDate(d.getDate() + daysAhead);
+  return d.toISOString().slice(0, 10);
+}
+
+$('registerBtn').onclick = () => authenticate('register');
+$('loginBtn').onclick = () => authenticate('login');
+$('logoutBtn').onclick = logout;
+$('searchBtn').onclick = search;
+$('addWatchBtn').onclick = addWatch;
+$('refreshBtn').onclick = refreshAll;
+
+$('sDate').value = isoDate(14);
+$('wDate').value = isoDate(14);
+render();
+refreshAll();
+setInterval(refreshAll, 15000);
+</script>
+</body>
+</html>
